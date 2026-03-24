@@ -1,0 +1,23 @@
+test_quicksort.py
+  17ea6e74860b9e54 1-12
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.18",
+  "base_commit_sha": "0cad63b492a22f31288b0ed60256835afcde9562",
+  "prompts": {
+    "17ea6e74860b9e54": {
+      "agent_id": {
+        "tool": "aiden",
+        "id": "4aa943a1-38ef-428a-b2ed-d1f849ec197c",
+        "model": "unknown"
+      },
+      "human_author": "郝国建 <haoguojian@bytedance.com>",
+      "messages": [],
+      "total_additions": 12,
+      "total_deletions": 0,
+      "accepted_lines": 12,
+      "overriden_lines": 0
+    }
+  }
+}
