@@ -14,7 +14,6 @@
 #   SCM_JWT_TOKEN   — 手动指定 JWT token，跳过 bytedcli
 #   SCM_USERNAME    — 下载用户名（默认从 bytedcli/git 自动获取）
 #   SCM_BASE_URL    — SCM 产物仓库地址
-#   GIT_REPO_URL    — mock-mesh Git 仓库 SSH 地址
 #   NPM_REGISTRY    — npm 镜像源（安装 bytedcli 时使用）
 #   MOCK_MESH_DIR   — mock-mesh 安装目录（默认 /opt/mock-mesh）
 
@@ -49,7 +48,6 @@ usage() {
   SCM_JWT_TOKEN   JWT token（跳过 bytedcli）
   SCM_USERNAME    下载用户名
   SCM_BASE_URL    SCM 产物仓库地址
-  GIT_REPO_URL    mock-mesh Git SSH 地址
   NPM_REGISTRY    npm 镜像源（安装 bytedcli 用）
   MOCK_MESH_DIR   安装目录（默认 /opt/mock-mesh）
 USAGE
@@ -74,17 +72,14 @@ ARTIFACT_REPO_PATH=$(echo "$ARTIFACT_REPO" | tr '.' '/')
 
 # ── 常量（均可通过环境变量覆盖）──────────────────────────────────────────────────
 SCM_BASE_URL="${SCM_BASE_URL:-}"
-GIT_REPO_URL="${GIT_REPO_URL:-}"
 MOCK_MESH_DIR="${MOCK_MESH_DIR:-/opt/mock-mesh}"
 NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmjs.org}"
 DOCKER_VER="27.3.1"
-GOPROXY="https://goproxy.cn,direct"
 TOKEN_CACHE="${HOME}/.mock-mesh/scm-token"
 
 PSM_SLUG=$(echo "$PSM" | tr '.' '-')
 SANDBOX_DIR="${MOCK_MESH_DIR}/deploy/ecs/sandbox/${PSM_SLUG}"
 STATE_FILE="${SANDBOX_DIR}/.build-state"
-COMPOSE_FILE="${SANDBOX_DIR}/docker-compose.yaml"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JWT 认证（自包含）
@@ -224,12 +219,10 @@ step "预检"
 [[ "$(uname -m)" == "x86_64" ]] || die "仅支持 x86_64，当前: $(uname -m)"
 
 [[ -n "$SCM_BASE_URL" ]] || die "请设置 SCM_BASE_URL 环境变量"
-[[ -n "$GIT_REPO_URL" ]] || die "请设置 GIT_REPO_URL 环境变量"
 
 ok "PSM:      ${PSM}"
 ok "SCM 仓库: ${ARTIFACT_REPO_PATH}"
 ok "SCM:      ${SCM_BASE_URL}"
-ok "Git:      ${GIT_REPO_URL}"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 2 — 安装依赖
@@ -414,9 +407,9 @@ ok "版本: ${VERSION}  产物: ${ARTIFACT_FILE}"
 
 # 幂等：版本未变且服务在跑
 if [[ "$VERSION" == "$LAST_VERSION" ]]; then
-    if compose_cmd -f "$COMPOSE_FILE" ps --services --filter status=running 2>/dev/null | grep -q biz-service; then
+    if compose_cmd -f "${SANDBOX_DIR}/docker-compose-biz.yaml" ps --services --filter status=running 2>/dev/null | grep -q biz-service; then
         ok "版本未变 (${VERSION})，服务运行中"
-        compose_cmd -f "$COMPOSE_FILE" ps
+        compose_cmd -f "${SANDBOX_DIR}/docker-compose-biz.yaml" ps
         exit 0
     fi
 fi
@@ -550,22 +543,56 @@ compose_cmd -f "$BIZ_COMPOSE" ps
 ok "业务服务已启动"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 6 — 拉取 mock-mesh & 启动 mock 组件
+# STEP 6 — 下载 mock-mesh & 启动 mock 组件
 # ══════════════════════════════════════════════════════════════════════════════
-step "拉取 mock-mesh"
+step "下载 mock-mesh"
 
-if [[ -d "${MOCK_MESH_DIR}/.git" ]]; then
-    info "更新 mock-mesh..."
-    git -C "$MOCK_MESH_DIR" pull --quiet
+MOCK_MESH_SCM_REPO="douyin/admin/mock_mesh"
+MOCK_MESH_SRC="${MOCK_MESH_DIR}/src"
+mkdir -p "$MOCK_MESH_SRC"
+
+# 查询 mock-mesh 最新版本
+info "查询 mock-mesh 最新版本 (${MOCK_MESH_SCM_REPO})..."
+CLI=$(_find_cli)
+eval "$(${CLI} -j scm list-repo-version "$MOCK_MESH_SCM_REPO" \
+    --status build_ok --page-size 1 2>/dev/null | \
+    python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    v = d['data']['versions'][0]
+    print('MM_VERSION=' + v['version'])
+    print('MM_BIN_PATH=' + v.get('bin_path', ''))
+except Exception as e:
+    print('# PARSE_ERROR: ' + str(e), file=sys.stderr)
+" 2>&2 || true)"
+[[ -n "${MM_VERSION:-}" ]] || die "未能获取 mock-mesh 版本号"
+
+MM_FILE="${MM_BIN_PATH:-$(echo "$MOCK_MESH_SCM_REPO" | tr '/' '.')_${MM_VERSION}.tar.gz}"
+MM_PATH="${MOCK_MESH_SRC}/${MM_FILE}"
+
+ok "mock-mesh 版本: ${MM_VERSION}  产物: ${MM_FILE}"
+
+# 下载（已缓存则跳过）
+if [[ -f "$MM_PATH" && -s "$MM_PATH" ]] && tar -tzf "$MM_PATH" &>/dev/null; then
+    ok "mock-mesh 产物已缓存: $(du -sh "$MM_PATH" | cut -f1)，跳过下载"
 else
-    info "克隆 mock-mesh..."
-    git clone --depth=50 "$GIT_REPO_URL" "$MOCK_MESH_DIR"
+    [[ -f "$MM_PATH" ]] && rm -f "$MM_PATH"
+    scm_download "${SCM_BASE_URL}/${MM_FILE}" "$MM_PATH"
 fi
-CURR_MOCK_HASH=$(git -C "$MOCK_MESH_DIR" rev-parse HEAD)
-ok "mock-mesh: ${CURR_MOCK_HASH:0:8}"
+
+# 解压
+info "解压 mock-mesh..."
+tar -xzf "$MM_PATH" -C "$MOCK_MESH_SRC"
+ok "mock-mesh 解压完成"
+
+# 确保二进制可执行
+chmod +x "${MOCK_MESH_SRC}/proxy" "${MOCK_MESH_SRC}/kitex-mock" \
+         "${MOCK_MESH_SRC}/grpc-mock" "${MOCK_MESH_SRC}/http-mock" \
+         "${MOCK_MESH_SRC}/init-iptables.sh"
 
 # mock-config-extra.yaml
-cat > "${SANDBOX_DIR}/mock-config-extra.yaml" << YAML
+cat > "${MOCK_MESH_SRC}/configs/mock-config-extra.yaml" << YAML
 # 自动生成 — ${PSM} @ ${VERSION}
 default_action: passthrough
 rules:
@@ -574,7 +601,7 @@ for psm in "${DOWNSTREAM_PSMS[@]:-}"; do
     case "$psm" in
         toutiao.mysql.*|toutiao.redis.*|byte.es.*) ;;
         *)
-            cat >> "${SANDBOX_DIR}/mock-config-extra.yaml" << YAML
+            cat >> "${MOCK_MESH_SRC}/configs/mock-config-extra.yaml" << YAML
   - name: "$(echo "$psm" | tr '.' '-')"
     psm: "${psm}"
     action: mock
@@ -584,140 +611,75 @@ YAML
     esac
 done
 
-# 完整 compose（业务 + mock 全套）
-cat > "$COMPOSE_FILE" << COMPOSEYAML
-version: "3.9"
-services:
-  mock-proxy:
-    build:
-      context: ${MOCK_MESH_DIR}
-      dockerfile: deploy/Dockerfile.proxy
-      args:
-        - GOPROXY=${GOPROXY}
-    user: "1337:1337"
-    ports:
-      - "19999:19999"
-      - "8600:8600"
-      - "28080:28080"
-    volumes:
-      - ${MOCK_MESH_DIR}/configs:/etc/mock-mesh/configs:ro
-      - ${MOCK_MESH_DIR}/idl:/etc/mock-mesh/idl:ro
-      - ${SANDBOX_DIR}/mock-config-extra.yaml:/etc/mock-mesh/configs/mock-config-extra.yaml:ro
-    environment:
-      - MOCK_CONFIG=/etc/mock-mesh/configs/mock-config.yaml
-      - MOCK_RULES_DIR=/etc/mock-mesh/configs/mock-rules
-      - MOCK_KITEX_ADDR=127.0.0.1:18001
-      - MOCK_GRPC_ADDR=127.0.0.1:18002
-      - MOCK_HTTP_ADDR=127.0.0.1:18003
-    restart: unless-stopped
+ok "mock-mesh 配置就绪"
 
-  kitex-mock:
-    build:
-      context: ${MOCK_MESH_DIR}
-      dockerfile: deploy/Dockerfile.kitex-mock
-      args:
-        - GOPROXY=${GOPROXY}
-    network_mode: "service:mock-proxy"
-    volumes:
-      - ${MOCK_MESH_DIR}/configs:/etc/mock-mesh/configs:ro
-      - ${MOCK_MESH_DIR}/idl:/etc/mock-mesh/idl:ro
-    depends_on: [mock-proxy]
-    restart: unless-stopped
+# 启动 mock-mesh 进程（直接二进制，不用 Docker）
+MOCK_LOG_DIR="${MOCK_MESH_DIR}/logs"
+MOCK_PID_DIR="${MOCK_MESH_DIR}/pids"
+mkdir -p "$MOCK_LOG_DIR" "$MOCK_PID_DIR"
 
-  http-mock:
-    build:
-      context: ${MOCK_MESH_DIR}
-      dockerfile: deploy/Dockerfile.http-mock
-      args:
-        - GOPROXY=${GOPROXY}
-    network_mode: "service:mock-proxy"
-    volumes:
-      - ${MOCK_MESH_DIR}/configs:/etc/mock-mesh/configs:ro
-    depends_on: [mock-proxy]
-    restart: unless-stopped
+# 停止旧进程
+for proc in proxy kitex-mock grpc-mock http-mock; do
+    if [[ -f "${MOCK_PID_DIR}/${proc}.pid" ]]; then
+        old_pid=$(cat "${MOCK_PID_DIR}/${proc}.pid")
+        kill "$old_pid" 2>/dev/null || true
+        rm -f "${MOCK_PID_DIR}/${proc}.pid"
+    fi
+done
+sleep 1
 
-  biz-service:
-    build:
-      context: ${SANDBOX_DIR}
-      dockerfile: ${SANDBOX_DIR}/Dockerfile.biz
-    network_mode: "service:mock-proxy"
-    cap_add: [NET_ADMIN]
-    depends_on: [mock-proxy, kitex-mock, http-mock]
-    environment:
-      - PSM=${PSM}
-      - CONSUL_HTTP_ADDR=127.0.0.1:8600
-      - MESH_NEGOTIATE_ADDR=
-      - SERVICE_MESH_EGRESS_ADDR=
-      - KITEX_LOG_DIR=/tmp/logs
-      - RUNTIME_LOGDIR=/tmp/logs
-      - PROXY_PORT=19999
-    restart: unless-stopped
-COMPOSEYAML
+info "启动 mock-mesh proxy..."
+MOCK_CONFIG="${MOCK_MESH_SRC}/configs/mock-config.yaml" \
+MOCK_RULES_DIR="${MOCK_MESH_SRC}/configs/mock-rules" \
+MOCK_KITEX_ADDR="127.0.0.1:18001" \
+MOCK_GRPC_ADDR="127.0.0.1:18002" \
+MOCK_HTTP_ADDR="127.0.0.1:18003" \
+    nohup "${MOCK_MESH_SRC}/proxy" > "${MOCK_LOG_DIR}/proxy.log" 2>&1 &
+echo $! > "${MOCK_PID_DIR}/proxy.pid"
 
-if [[ "$NEED_MYSQL" == "true" ]]; then cat >> "$COMPOSE_FILE" << 'MYSQL'
+info "启动 kitex-mock..."
+MOCK_CONFIG="${MOCK_MESH_SRC}/configs/mock-config.yaml" \
+MOCK_RULES_DIR="${MOCK_MESH_SRC}/configs/mock-rules" \
+    nohup "${MOCK_MESH_SRC}/kitex-mock" > "${MOCK_LOG_DIR}/kitex-mock.log" 2>&1 &
+echo $! > "${MOCK_PID_DIR}/kitex-mock.pid"
 
-  mysql:
-    image: mysql:8.0
-    environment:
-      MYSQL_ROOT_PASSWORD: mock123
-    ports: ["3306:3306"]
-    volumes: [mysql-data:/var/lib/mysql]
-    restart: unless-stopped
-MYSQL
-fi
+info "启动 grpc-mock..."
+MOCK_CONFIG="${MOCK_MESH_SRC}/configs/mock-config.yaml" \
+MOCK_RULES_DIR="${MOCK_MESH_SRC}/configs/mock-rules" \
+    nohup "${MOCK_MESH_SRC}/grpc-mock" > "${MOCK_LOG_DIR}/grpc-mock.log" 2>&1 &
+echo $! > "${MOCK_PID_DIR}/grpc-mock.pid"
 
-if [[ "$NEED_REDIS" == "true" ]]; then cat >> "$COMPOSE_FILE" << 'REDIS'
+info "启动 http-mock..."
+MOCK_CONFIG="${MOCK_MESH_SRC}/configs/mock-config.yaml" \
+MOCK_RULES_DIR="${MOCK_MESH_SRC}/configs/mock-rules" \
+    nohup "${MOCK_MESH_SRC}/http-mock" > "${MOCK_LOG_DIR}/http-mock.log" 2>&1 &
+echo $! > "${MOCK_PID_DIR}/http-mock.pid"
 
-  redis:
-    image: redis:7-alpine
-    ports: ["6379:6379"]
-    restart: unless-stopped
-REDIS
-fi
+sleep 2
 
-if [[ "$NEED_ES" == "true" ]]; then cat >> "$COMPOSE_FILE" << 'ES'
+# 检查进程是否存活
+ALL_OK=true
+for proc in proxy kitex-mock grpc-mock http-mock; do
+    pid=$(cat "${MOCK_PID_DIR}/${proc}.pid" 2>/dev/null)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        ok "${proc} 运行中 (pid=${pid})"
+    else
+        warn "${proc} 启动失败，查看日志: ${MOCK_LOG_DIR}/${proc}.log"
+        ALL_OK=false
+    fi
+done
 
-  elasticsearch:
-    image: elasticsearch:8.11.4
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms512m -Xmx512m
-    ports: ["9200:9200"]
-    volumes: [es-data:/usr/share/elasticsearch/data]
-    restart: unless-stopped
-ES
-fi
-
-if [[ "$NEED_MYSQL" == "true" || "$NEED_ES" == "true" ]]; then
-    echo "" >> "$COMPOSE_FILE"
-    echo "volumes:" >> "$COMPOSE_FILE"
-    [[ "$NEED_MYSQL" == "true" ]] && echo "  mysql-data:" >> "$COMPOSE_FILE"
-    [[ "$NEED_ES"    == "true" ]] && echo "  es-data:"    >> "$COMPOSE_FILE"
-fi
-
-ok "完整沙箱配置生成完成"
-
-info "编译 mock-mesh 镜像..."
-compose_cmd -f "$COMPOSE_FILE" build mock-proxy kitex-mock http-mock
-
-info "切换到完整沙箱模式（停止独立业务服务，启动全套）..."
-compose_cmd -f "$BIZ_COMPOSE" down 2>/dev/null || true
-compose_cmd -f "$COMPOSE_FILE" up -d
+[[ "$ALL_OK" == "true" ]] || warn "部分 mock-mesh 组件启动失败"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 7 — 验证
 # ══════════════════════════════════════════════════════════════════════════════
-step "验证服务"
-
-info "等待服务就绪..."
-sleep 5
-compose_cmd -f "$COMPOSE_FILE" ps
+step "验证"
 
 # 保存状态
 cat > "$STATE_FILE" << STATE
 VERSION=${VERSION}
-MOCK_HASH=${CURR_MOCK_HASH}
+MOCK_MESH_VERSION=${MM_VERSION}
 BUILT_AT=$(date -Iseconds)
 PSM=${PSM}
 ARTIFACT=${ARTIFACT_FILE}
@@ -727,13 +689,15 @@ HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1")
 echo "" >&2
 echo -e "${GREEN}${BOLD}══════════════════════════════════════════════" >&2
 echo " 沙箱就绪！" >&2
-echo " PSM:     ${PSM}" >&2
-echo " Version: ${VERSION}" >&2
+echo " PSM:        ${PSM}" >&2
+echo " 业务版本:   ${VERSION}" >&2
+echo " mock-mesh:  ${MM_VERSION}" >&2
 echo -e "══════════════════════════════════════════════${NC}" >&2
 echo "" >&2
-echo -e "  Admin UI   → ${CYAN}http://${HOST_IP}:28080${NC}" >&2
-echo -e "  Consul     → ${CYAN}http://${HOST_IP}:8600/v1/health/service/<psm>${NC}" >&2
+echo -e "  Admin UI       → ${CYAN}http://${HOST_IP}:28080${NC}" >&2
+echo -e "  业务服务日志   → docker compose -f ${BIZ_COMPOSE} logs -f biz-service" >&2
+echo -e "  mock-mesh 日志 → tail -f ${MOCK_LOG_DIR}/*.log" >&2
 echo "" >&2
-echo "  查看日志:  docker compose -f ${COMPOSE_FILE} logs -f biz-service" >&2
-echo "  停止沙箱:  docker compose -f ${COMPOSE_FILE} down" >&2
+echo "  停止业务:     docker compose -f ${BIZ_COMPOSE} down" >&2
+echo "  停止 mock:    kill \$(cat ${MOCK_PID_DIR}/*.pid)" >&2
 echo "" >&2
