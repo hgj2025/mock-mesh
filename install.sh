@@ -182,7 +182,6 @@ scm_download() {
     username=$(_get_username) || return 1
     token=$(_get_token) || return 1
     info "下载: $(basename "$url")"
-    info "用户: ${username}"
 
     http_code=$(_authed_curl "$url" "$output" "$token")
 
