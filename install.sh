@@ -422,9 +422,10 @@ if [[ "$VERSION" == "$LAST_VERSION" ]]; then
     fi
 fi
 
-if [[ -f "$ARTIFACT_PATH" && -s "$ARTIFACT_PATH" ]]; then
-    ok "产物已缓存: ${ARTIFACT_FILE}"
+if [[ -f "$ARTIFACT_PATH" && -s "$ARTIFACT_PATH" ]] && tar -tzf "$ARTIFACT_PATH" &>/dev/null; then
+    ok "产物已缓存: ${ARTIFACT_FILE} ($(du -sh "$ARTIFACT_PATH" | cut -f1))，跳过下载"
 else
+    [[ -f "$ARTIFACT_PATH" ]] && { warn "已有文件损坏，重新下载"; rm -f "$ARTIFACT_PATH"; }
     scm_download "$ARTIFACT_URL" "$ARTIFACT_PATH"
 fi
 
@@ -483,8 +484,10 @@ chmod +x "${SANDBOX_DIR}/entrypoint-biz.sh"
 CMD_LINE="./bootstrap.sh"
 [[ ! -f "$EXTRACT_DIR/bootstrap.sh" ]] && CMD_LINE="./bin/${BIN_NAME}"
 
+BIZ_BASE_IMAGE="${BIZ_BASE_IMAGE:-hub.byted.org/x86_64/base/ubuntu.jammy.tce_service:dbb61d79c899a3d415dd9b6a887fbfcb}"
+
 cat > "${SANDBOX_DIR}/Dockerfile.biz" << DOCKERFILE
-FROM ubuntu:22.04
+FROM ${BIZ_BASE_IMAGE}
 RUN apt-get update && apt-get install -y --no-install-recommends \\
         ca-certificates iptables ip6tables gosu \\
     && rm -rf /var/lib/apt/lists/*
