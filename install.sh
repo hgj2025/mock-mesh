@@ -113,8 +113,8 @@ _get_username() {
 
     local cli; cli=$(_find_cli 2>/dev/null) || true
     if [[ -n "$cli" ]]; then
-        local name; name=$("$cli" -j auth userinfo 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 || true)
-        [[ -n "$name" ]] && { echo "$name"; return; }
+        local uname; uname=$("$cli" -j auth userinfo 2>/dev/null | grep -o '"username":"[^"]*"' | head -1 | cut -d'"' -f4 || true)
+        [[ -n "$uname" ]] && { echo "$uname"; return; }
     fi
 
     local ge; ge=$(git config user.email 2>/dev/null || true)
