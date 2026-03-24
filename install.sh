@@ -463,29 +463,11 @@ done
 ok "依赖: MySQL=${NEED_MYSQL} ES=${NEED_ES} Redis=${NEED_REDIS}, 下游PSM: ${#DOWNSTREAM_PSMS[@]} 个"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — 拉取 mock-mesh 代码
+# STEP 5 — 构建 & 启动业务服务
 # ══════════════════════════════════════════════════════════════════════════════
-step "拉取 mock-mesh"
+step "启动业务服务"
 
-if [[ -d "${MOCK_MESH_DIR}/.git" ]]; then
-    info "更新 mock-mesh..."
-    git -C "$MOCK_MESH_DIR" pull --quiet
-else
-    info "克隆 mock-mesh..."
-    git clone --depth=50 "$GIT_REPO_URL" "$MOCK_MESH_DIR"
-fi
-CURR_MOCK_HASH=$(git -C "$MOCK_MESH_DIR" rev-parse HEAD)
-ok "mock-mesh: ${CURR_MOCK_HASH:0:8}"
-
-LAST_MOCK_HASH=$(grep "^MOCK_HASH=" "$STATE_FILE" 2>/dev/null | cut -d= -f2 || true)
-MOCK_CHANGED=false
-[[ "$CURR_MOCK_HASH" != "$LAST_MOCK_HASH" ]] && MOCK_CHANGED=true
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 6 — 生成沙箱配置
-# ══════════════════════════════════════════════════════════════════════════════
-step "生成沙箱配置"
-
+# entrypoint-biz.sh
 cat > "${SANDBOX_DIR}/entrypoint-biz.sh" << 'ENTRY'
 #!/bin/sh
 set -e
@@ -519,6 +501,104 @@ ENTRYPOINT ["/entrypoint-biz.sh"]
 CMD ["${CMD_LINE}"]
 DOCKERFILE
 
+# 业务服务 compose（独立，不依赖 mock-mesh）
+BIZ_COMPOSE="${SANDBOX_DIR}/docker-compose-biz.yaml"
+DEPENDS_BIZ="["
+[[ "$NEED_MYSQL" == "true" ]] && DEPENDS_BIZ="${DEPENDS_BIZ}mysql, "
+[[ "$NEED_ES"    == "true" ]] && DEPENDS_BIZ="${DEPENDS_BIZ}elasticsearch, "
+[[ "$NEED_REDIS" == "true" ]] && DEPENDS_BIZ="${DEPENDS_BIZ}redis, "
+DEPENDS_BIZ="${DEPENDS_BIZ%%, }]"
+[[ "$DEPENDS_BIZ" == "[]" ]] && DEPENDS_BIZ=""
+
+cat > "$BIZ_COMPOSE" << BIZYAML
+version: "3.9"
+services:
+  biz-service:
+    build:
+      context: ${SANDBOX_DIR}
+      dockerfile: ${SANDBOX_DIR}/Dockerfile.biz
+    cap_add: [NET_ADMIN]
+${DEPENDS_BIZ:+    depends_on: ${DEPENDS_BIZ}}
+    ports:
+      - "8888:8888"
+      - "18888:18888"
+    environment:
+      - PSM=${PSM}
+      - KITEX_LOG_DIR=/tmp/logs
+      - RUNTIME_LOGDIR=/tmp/logs
+    restart: unless-stopped
+BIZYAML
+
+if [[ "$NEED_MYSQL" == "true" ]]; then cat >> "$BIZ_COMPOSE" << 'MYSQL'
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: mock123
+    ports: ["3306:3306"]
+    volumes: [mysql-data:/var/lib/mysql]
+    restart: unless-stopped
+MYSQL
+fi
+
+if [[ "$NEED_REDIS" == "true" ]]; then cat >> "$BIZ_COMPOSE" << 'REDIS'
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    restart: unless-stopped
+REDIS
+fi
+
+if [[ "$NEED_ES" == "true" ]]; then cat >> "$BIZ_COMPOSE" << 'ES'
+
+  elasticsearch:
+    image: elasticsearch:8.11.4
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports: ["9200:9200"]
+    volumes: [es-data:/usr/share/elasticsearch/data]
+    restart: unless-stopped
+ES
+fi
+
+if [[ "$NEED_MYSQL" == "true" || "$NEED_ES" == "true" ]]; then
+    echo "" >> "$BIZ_COMPOSE"
+    echo "volumes:" >> "$BIZ_COMPOSE"
+    [[ "$NEED_MYSQL" == "true" ]] && echo "  mysql-data:" >> "$BIZ_COMPOSE"
+    [[ "$NEED_ES"    == "true" ]] && echo "  es-data:"    >> "$BIZ_COMPOSE"
+fi
+
+ok "业务服务配置生成完成"
+
+info "构建业务服务镜像..."
+compose_cmd -f "$BIZ_COMPOSE" build biz-service
+
+info "启动业务服务..."
+compose_cmd -f "$BIZ_COMPOSE" up -d
+
+sleep 5
+compose_cmd -f "$BIZ_COMPOSE" ps
+
+ok "业务服务已启动"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 6 — 拉取 mock-mesh & 启动 mock 组件
+# ══════════════════════════════════════════════════════════════════════════════
+step "拉取 mock-mesh"
+
+if [[ -d "${MOCK_MESH_DIR}/.git" ]]; then
+    info "更新 mock-mesh..."
+    git -C "$MOCK_MESH_DIR" pull --quiet
+else
+    info "克隆 mock-mesh..."
+    git clone --depth=50 "$GIT_REPO_URL" "$MOCK_MESH_DIR"
+fi
+CURR_MOCK_HASH=$(git -C "$MOCK_MESH_DIR" rev-parse HEAD)
+ok "mock-mesh: ${CURR_MOCK_HASH:0:8}"
+
 # mock-config-extra.yaml
 cat > "${SANDBOX_DIR}/mock-config-extra.yaml" << YAML
 # 自动生成 — ${PSM} @ ${VERSION}
@@ -539,13 +619,7 @@ YAML
     esac
 done
 
-# docker-compose.yaml
-DEPENDS="[mock-proxy, kitex-mock, http-mock"
-[[ "$NEED_MYSQL" == "true" ]] && DEPENDS="${DEPENDS}, mysql"
-[[ "$NEED_ES"    == "true" ]] && DEPENDS="${DEPENDS}, elasticsearch"
-[[ "$NEED_REDIS" == "true" ]] && DEPENDS="${DEPENDS}, redis"
-DEPENDS="${DEPENDS}]"
-
+# 完整 compose（业务 + mock 全套）
 cat > "$COMPOSE_FILE" << COMPOSEYAML
 version: "3.9"
 services:
@@ -603,7 +677,7 @@ services:
       dockerfile: ${SANDBOX_DIR}/Dockerfile.biz
     network_mode: "service:mock-proxy"
     cap_add: [NET_ADMIN]
-    depends_on: ${DEPENDS}
+    depends_on: [mock-proxy, kitex-mock, http-mock]
     environment:
       - PSM=${PSM}
       - CONSUL_HTTP_ADDR=127.0.0.1:8600
@@ -657,23 +731,17 @@ if [[ "$NEED_MYSQL" == "true" || "$NEED_ES" == "true" ]]; then
     [[ "$NEED_ES"    == "true" ]] && echo "  es-data:"    >> "$COMPOSE_FILE"
 fi
 
-ok "配置文件生成完成"
+ok "完整沙箱配置生成完成"
+
+info "编译 mock-mesh 镜像..."
+compose_cmd -f "$COMPOSE_FILE" build mock-proxy kitex-mock http-mock
+
+info "切换到完整沙箱模式（停止独立业务服务，启动全套）..."
+compose_cmd -f "$BIZ_COMPOSE" down 2>/dev/null || true
+compose_cmd -f "$COMPOSE_FILE" up -d
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 7 — 编译 & 启动
-# ══════════════════════════════════════════════════════════════════════════════
-step "编译 & 启动"
-
-if [[ "$MOCK_CHANGED" == "true" ]]; then
-    info "mock-mesh 有更新，重新编译 mock 镜像..."
-    compose_cmd -f "$COMPOSE_FILE" build mock-proxy kitex-mock http-mock
-fi
-
-info "启动所有服务..."
-compose_cmd -f "$COMPOSE_FILE" up -d --build biz-service
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 8 — 验证
+# STEP 7 — 验证
 # ══════════════════════════════════════════════════════════════════════════════
 step "验证服务"
 
