@@ -378,13 +378,13 @@ LAST_VERSION=""
 if [[ -z "$VERSION" ]]; then
     info "查询最新成功构建版本 (${ARTIFACT_REPO_PATH})..."
     CLI=$(_find_cli)
-    VERSION=$("$CLI" scm list-repo-version "$ARTIFACT_REPO_PATH" \
-        --status build_ok --page-size 1 --json 2>/dev/null | \
+    VERSION=$("$CLI" -j scm list-repo-version "$ARTIFACT_REPO_PATH" \
+        --status build_ok --page-size 1 2>/dev/null | \
         python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
-    print(d['data'][0]['version'])
+    print(d['data']['versions'][0]['version'])
 except Exception:
     pass
 " 2>/dev/null || true)
