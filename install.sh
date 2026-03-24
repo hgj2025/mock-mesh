@@ -378,17 +378,23 @@ LAST_VERSION=""
 if [[ -z "$VERSION" ]]; then
     info "查询最新成功构建版本 (${ARTIFACT_REPO_PATH})..."
     CLI=$(_find_cli)
-    VERSION=$("$CLI" -j scm list-repo-version "$ARTIFACT_REPO_PATH" \
-        --status build_ok --page-size 1 2>/dev/null | \
-        python3 -c "
+    info "bytedcli 路径: ${CLI}"
+    info "执行: ${CLI} -j scm list-repo-version ${ARTIFACT_REPO_PATH} --status build_ok --page-size 1"
+
+    SCM_RAW=$("$CLI" -j scm list-repo-version "$ARTIFACT_REPO_PATH" \
+        --status build_ok --page-size 1 2>&1 || true)
+    info "SCM 返回（前 300 字符）: ${SCM_RAW:0:300}"
+
+    VERSION=$(echo "$SCM_RAW" | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
     print(d['data']['versions'][0]['version'])
-except Exception:
-    pass
-" 2>/dev/null || true)
-    [[ -n "$VERSION" ]] || die "未能自动获取版本号，请通过 --version 指定"
+except Exception as e:
+    print('PARSE_ERROR: ' + str(e), file=sys.stderr)
+" 2>&2 || true)
+    info "解析版本: [${VERSION}]"
+    [[ -n "$VERSION" && "$VERSION" != "" ]] || die "未能自动获取版本号，请通过 --version 指定"
 fi
 
 ARTIFACT_FILE="${ARTIFACT_PREFIX}_${VERSION}.tar.gz"
