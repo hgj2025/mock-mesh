@@ -489,7 +489,7 @@ BIZ_BASE_IMAGE="${BIZ_BASE_IMAGE:-hub.byted.org/x86_64/base/ubuntu.jammy.tce_ser
 cat > "${SANDBOX_DIR}/Dockerfile.biz" << DOCKERFILE
 FROM ${BIZ_BASE_IMAGE}
 RUN apt-get update && apt-get install -y --no-install-recommends \\
-        ca-certificates iptables ip6tables gosu \\
+        ca-certificates iptables gosu \\
     && rm -rf /var/lib/apt/lists/*
 RUN groupadd -g 1000 app && useradd -u 1000 -g 1000 -m app
 WORKDIR /app
