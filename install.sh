@@ -8,7 +8,6 @@
 # 认证方式（优先级从高到低）：
 #   1. 环境变量 SCM_JWT_TOKEN（直接使用）
 #   2. bytedcli auth login → 自动获取 JWT
-#   3. 交互式手动粘贴 JWT token
 #
 # 环境变量（可选）：
 #   SCM_JWT_TOKEN   — 手动指定 JWT token，跳过 bytedcli
