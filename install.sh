@@ -194,10 +194,10 @@ CACHE
 # 带认证下载
 _authed_curl() {
     local url="$1" output="$2" token="$3"
-    curl -f --location --request GET \
+    curl --location --request GET \
         -H "x-jwt-token: ${token}" \
         -o "$output" -w "%{http_code}" \
-        "$url" 2>/dev/null || true
+        -s "$url" 2>/dev/null
 }
 
 # SCM 产物下载（含重试）
@@ -212,7 +212,7 @@ scm_download() {
     info "用户: ${username}"
     info "URL:  ${url}"
     info "Token: ${token:0:20}... (${#token} chars)"
-    info "Header: x-jwt-token / x-platform-proxy-user: ${username}"
+    info "Header: x-jwt-token only (no x-platform-proxy-user)"
 
     http_code=$(_authed_curl "$url" "$output" "$token")
 
