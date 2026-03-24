@@ -8,6 +8,7 @@
 # 认证方式（优先级从高到低）：
 #   1. 环境变量 SCM_JWT_TOKEN（直接使用）
 #   2. bytedcli auth login → 自动获取 JWT
+#   3. 交互式手动粘贴 JWT token
 #
 # 环境变量（可选）：
 #   SCM_JWT_TOKEN   — 手动指定 JWT token，跳过 bytedcli
@@ -22,10 +23,10 @@ IFS=$'\n\t'
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-info()  { echo -e "${BLUE}[·]${NC} $*"; }
-ok()    { echo -e "${GREEN}[✓]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
-step()  { echo -e "\n${BOLD}${CYAN}━━ $* ━━${NC}"; }
+info()  { echo -e "${BLUE}[·]${NC} $*" >&2; }
+ok()    { echo -e "${GREEN}[✓]${NC} $*" >&2; }
+warn()  { echo -e "${YELLOW}[!]${NC} $*" >&2; }
+step()  { echo -e "\n${BOLD}${CYAN}━━ $* ━━${NC}" >&2; }
 die()   { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
 
 # ── 参数解析 ──────────────────────────────────────────────────────────────────
