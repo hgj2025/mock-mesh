@@ -50,10 +50,10 @@ usage() {
 示例:
   # bytedcli 自动获取 token
   bytedcli auth login
-  bash install.sh --artifact douyin.admin.admin_platform --version 1.0.1.852
+  bash install.sh --artifact your.service.name --version 1.0.1.852
 
   # 手动传 token
-  SCM_JWT_TOKEN="eyJ..." bash install.sh --artifact douyin.admin.admin_platform --version 1.0.1.852
+  SCM_JWT_TOKEN="eyJ..." bash install.sh --artifact your.service.name --version 1.0.1.852
 USAGE
     exit 1
 }
@@ -92,12 +92,12 @@ _find_cli() {
 # 确保 bytedcli 已登录
 _ensure_login() {
     local cli="$1"
-    if "$cli" auth status --json 2>/dev/null | grep -q '"loggedIn":true'; then
+    if "$cli" -j auth status 2>/dev/null | grep -q '"loggedIn":true'; then
         return 0
     fi
     info "需要 SSO 登录，将打开浏览器..."
     "$cli" auth login >&2
-    "$cli" auth status --json 2>/dev/null | grep -q '"loggedIn":true' || {
+    "$cli" -j auth status 2>/dev/null | grep -q '"loggedIn":true' || {
         die "SSO 登录失败，请先执行: bytedcli auth login"
     }
 }
@@ -113,8 +113,8 @@ _get_username() {
 
     local cli; cli=$(_find_cli 2>/dev/null) || true
     if [[ -n "$cli" ]]; then
-        local email; email=$("$cli" auth userinfo --json 2>/dev/null | grep -o '"email":"[^"]*"' | cut -d'"' -f4 || true)
-        [[ -n "$email" ]] && { echo "${email%%@*}"; return; }
+        local name; name=$("$cli" -j auth userinfo 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 || true)
+        [[ -n "$name" ]] && { echo "$name"; return; }
     fi
 
     local ge; ge=$(git config user.email 2>/dev/null || true)
@@ -267,8 +267,8 @@ install_bytedcli() {
     fi
     info "安装 bytedcli..."
     NPM_CONFIG_REGISTRY="$NPM_REGISTRY" \
-        npm install -g @bytedance-dev/bytedcli@latest 2>/dev/null || \
-        die "bytedcli 安装失败\n  请手动安装: NPM_CONFIG_REGISTRY=<your-npm-registry> npm install -g @bytedance-dev/bytedcli@latest"
+        npm install -g bytedcli@latest 2>/dev/null || \
+        die "bytedcli 安装失败\n  请手动安装: NPM_CONFIG_REGISTRY=<your-npm-registry> npm install -g bytedcli@latest"
 }
 
 if _find_cli &>/dev/null; then
