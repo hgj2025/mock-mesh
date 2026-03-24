@@ -3,7 +3,7 @@
 #
 # 用法：
 #   curl -fsSL https://raw.githubusercontent.com/hgj2025/mock-mesh/main/install.sh | \
-#       bash -s -- --psm <psm> --artifact <prefix> [--version <ver>]
+#       bash -s -- --psm <psm> --artifact <scm_repo_path> [--version <ver>]
 #
 # 认证方式（优先级从高到低）：
 #   1. 环境变量 SCM_JWT_TOKEN（直接使用）
@@ -33,16 +33,16 @@ die()   { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
 
 # ── 参数解析 ──────────────────────────────────────────────────────────────────
 PSM=""
-ARTIFACT_PREFIX=""
+ARTIFACT_REPO=""
 VERSION=""
 
 usage() {
     cat >&2 <<'USAGE'
-用法: bash install.sh --psm <psm> --artifact <prefix> [--version <ver>]
+用法: bash install.sh --psm <psm> --artifact <scm_repo_path> [--version <ver>]
 
 参数:
-  --psm        服务 PSM
-  --artifact   SCM 产物前缀（仓库路径 / 换 .）
+  --psm        服务 PSM（如 toutiao.douyin.admin_platform）
+  --artifact   SCM 仓库路径（如 douyin/admin/admin_platform）
   --version    产物版本号（可选，不填自动查询最新）
 
 环境变量:
@@ -59,17 +59,18 @@ USAGE
 while [[ $# -gt 0 ]]; do
     case $1 in
         --psm)        PSM="$2";              shift 2 ;;
-        --artifact)   ARTIFACT_PREFIX="$2";  shift 2 ;;
+        --artifact)   ARTIFACT_REPO="$2";    shift 2 ;;
         --version)    VERSION="$2";          shift 2 ;;
         --help|-h)    usage ;;
         *) die "未知参数: $1" ;;
     esac
 done
 
-[[ -n "$PSM"             ]] || die "缺少 --psm 参数"
-[[ -n "$ARTIFACT_PREFIX" ]] || die "缺少 --artifact 参数"
+[[ -n "$PSM"           ]] || die "缺少 --psm 参数"
+[[ -n "$ARTIFACT_REPO" ]] || die "缺少 --artifact 参数（SCM 仓库路径，如 douyin/admin/admin_platform）"
 
-ARTIFACT_REPO_PATH=$(echo "$ARTIFACT_PREFIX" | tr '.' '/')
+# SCM 仓库路径（直接使用，支持 / 或 . 分隔）
+ARTIFACT_REPO_PATH=$(echo "$ARTIFACT_REPO" | tr '.' '/')
 
 # ── 常量（均可通过环境变量覆盖）──────────────────────────────────────────────────
 SCM_BASE_URL="${SCM_BASE_URL:-}"
@@ -227,7 +228,7 @@ step "预检"
 [[ -n "$GIT_REPO_URL" ]] || die "请设置 GIT_REPO_URL 环境变量"
 
 ok "PSM:      ${PSM}"
-ok "产物前缀: ${ARTIFACT_PREFIX}"
+ok "SCM 仓库: ${ARTIFACT_REPO_PATH}"
 ok "SCM:      ${SCM_BASE_URL}"
 ok "Git:      ${GIT_REPO_URL}"
 
@@ -383,21 +384,30 @@ if [[ -z "$VERSION" ]]; then
 
     SCM_RAW=$("$CLI" -j scm list-repo-version "$ARTIFACT_REPO_PATH" \
         --status build_ok --page-size 1 2>&1 || true)
-    info "SCM 返回（前 300 字符）: ${SCM_RAW:0:300}"
 
-    VERSION=$(echo "$SCM_RAW" | python3 -c "
+    # 从 SCM 响应同时取版本号和 tar_url
+    eval "$(echo "$SCM_RAW" | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
-    print(d['data']['versions'][0]['version'])
+    v = d['data']['versions'][0]
+    print('VERSION=' + v['version'])
+    print('SCM_TAR_URL=' + v.get('tar_url', ''))
+    print('SCM_BIN_PATH=' + v.get('bin_path', ''))
 except Exception as e:
-    print('PARSE_ERROR: ' + str(e), file=sys.stderr)
-" 2>&2 || true)
-    info "解析版本: [${VERSION}]"
-    [[ -n "$VERSION" && "$VERSION" != "" ]] || die "未能自动获取版本号，请通过 --version 指定"
+    print('# PARSE_ERROR: ' + str(e), file=sys.stderr)
+" 2>&2 || true)"
+    info "解析版本: ${VERSION}, tar_url: ${SCM_TAR_URL:-无}, bin_path: ${SCM_BIN_PATH:-无}"
+    [[ -n "$VERSION" ]] || die "未能自动获取版本号，请通过 --version 指定"
 fi
 
-ARTIFACT_FILE="${ARTIFACT_PREFIX}_${VERSION}.tar.gz"
+# 产物文件名：优先用 SCM 返回的 bin_path，否则从仓库路径推导（/ 换 .）
+if [[ -n "${SCM_BIN_PATH:-}" ]]; then
+    ARTIFACT_FILE="$SCM_BIN_PATH"
+else
+    ARTIFACT_DOT_PREFIX=$(echo "$ARTIFACT_REPO_PATH" | tr '/' '.')
+    ARTIFACT_FILE="${ARTIFACT_DOT_PREFIX}_${VERSION}.tar.gz"
+fi
 ARTIFACT_URL="${SCM_BASE_URL}/${ARTIFACT_FILE}"
 ARTIFACT_PATH="${SANDBOX_DIR}/${ARTIFACT_FILE}"
 
