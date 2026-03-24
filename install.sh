@@ -92,12 +92,12 @@ _find_cli() {
 # 确保 bytedcli 已登录
 _ensure_login() {
     local cli="$1"
-    if "$cli" -j auth status 2>/dev/null | grep -q '"loggedIn":true'; then
+    if "$cli" -j auth status 2>/dev/null | grep -q '"authenticated":true'; then
         return 0
     fi
     info "需要 SSO 登录，将打开浏览器..."
     "$cli" auth login >&2
-    "$cli" -j auth status 2>/dev/null | grep -q '"loggedIn":true' || {
+    "$cli" -j auth status 2>/dev/null | grep -q '"authenticated":true' || {
         die "SSO 登录失败，请先执行: bytedcli auth login"
     }
 }
