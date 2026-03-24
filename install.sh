@@ -486,6 +486,22 @@ CMD_LINE="./bootstrap.sh"
 
 BIZ_BASE_IMAGE="${BIZ_BASE_IMAGE:-hub.byted.org/x86_64/base/ubuntu.jammy.tce_service:dbb61d79c899a3d415dd9b6a887fbfcb}"
 
+# 预拉基础镜像（避免每次 build 都拉）
+if docker image inspect "$BIZ_BASE_IMAGE" &>/dev/null; then
+    ok "基础镜像已存在: ${BIZ_BASE_IMAGE##*/}"
+else
+    info "拉取基础镜像: ${BIZ_BASE_IMAGE}..."
+    docker pull "$BIZ_BASE_IMAGE" || die "基础镜像拉取失败"
+fi
+
+# .dockerignore 减小 build context（排除解压目录和其他产物）
+cat > "${SANDBOX_DIR}/.dockerignore" << 'DIGNORE'
+extracted/
+*.yaml
+.build-state
+.dockerignore
+DIGNORE
+
 cat > "${SANDBOX_DIR}/Dockerfile.biz" << DOCKERFILE
 FROM ${BIZ_BASE_IMAGE}
 RUN apt-get update && apt-get install -y --no-install-recommends \\
