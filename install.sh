@@ -149,11 +149,19 @@ _get_token() {
         [[ -n "$ct" ]] && warn "缓存 token 已过期，重新获取..."
     fi
 
-    # 3. bytedcli
+    # 3. bytedcli（直接尝试拿 token，拿不到再触发登录）
     local cli; cli=$(_find_cli 2>/dev/null) || true
     if [[ -n "$cli" ]]; then
-        _ensure_login "$cli"
         local t; t=$("$cli" auth get-bytecloud-jwt-token 2>/dev/null || true)
+        if [[ -n "$t" && ${#t} -gt 20 ]]; then
+            ok "JWT token 获取成功 (via bytedcli, ${#t} chars)"
+            echo "$t"
+            return
+        fi
+        # token 为空，尝试登录后重试
+        info "需要 SSO 登录..."
+        "$cli" auth login >&2
+        t=$("$cli" auth get-bytecloud-jwt-token 2>/dev/null || true)
         if [[ -n "$t" && ${#t} -gt 20 ]]; then
             ok "JWT token 获取成功 (via bytedcli, ${#t} chars)"
             echo "$t"
