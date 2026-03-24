@@ -471,12 +471,8 @@ step "启动业务服务"
 cat > "${SANDBOX_DIR}/entrypoint-biz.sh" << 'ENTRY'
 #!/bin/sh
 set -e
-PROXY_PORT="${PROXY_PORT:-19999}"
-BIZ_UID="${BIZ_UID:-1000}"
-iptables  -t nat -A OUTPUT -m owner --uid-owner "$BIZ_UID" -p tcp -j REDIRECT --to-port "$PROXY_PORT" || true
-ip6tables -t nat -A OUTPUT -m owner --uid-owner "$BIZ_UID" -p tcp -j REDIRECT --to-port "$PROXY_PORT" || true
-echo "[entrypoint-biz] iptables: uid=$BIZ_UID → :$PROXY_PORT"
-exec gosu "$BIZ_UID:$BIZ_UID" "$@"
+echo "[entrypoint-biz] starting: $@"
+exec "$@"
 ENTRY
 chmod +x "${SANDBOX_DIR}/entrypoint-biz.sh"
 
@@ -503,15 +499,10 @@ DIGNORE
 
 cat > "${SANDBOX_DIR}/Dockerfile.biz" << DOCKERFILE
 FROM ${BIZ_BASE_IMAGE}
-RUN apt-get update && apt-get install -y --no-install-recommends \\
-        ca-certificates iptables gosu \\
-    && rm -rf /var/lib/apt/lists/*
-RUN groupadd -g 1000 app && useradd -u 1000 -g 1000 -m app
 WORKDIR /app
 ADD ${ARTIFACT_FILE} ./
 RUN find bin -type f -exec chmod +x {} \\; \\
-    && (chmod +x bootstrap.sh 2>/dev/null || true) \\
-    && chown -R app:app /app
+    && (chmod +x bootstrap.sh 2>/dev/null || true)
 COPY entrypoint-biz.sh /entrypoint-biz.sh
 RUN chmod +x /entrypoint-biz.sh
 EXPOSE 8888 18888
