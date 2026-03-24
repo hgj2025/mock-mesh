@@ -526,8 +526,6 @@ services:
     build:
       context: ${SANDBOX_DIR}
       dockerfile: ${SANDBOX_DIR}/Dockerfile.biz
-    cap_add: [NET_ADMIN]
-${DEPENDS_BIZ:+    depends_on: ${DEPENDS_BIZ}}
     ports:
       - "8888:8888"
       - "18888:18888"
@@ -537,48 +535,6 @@ ${DEPENDS_BIZ:+    depends_on: ${DEPENDS_BIZ}}
       - RUNTIME_LOGDIR=/tmp/logs
     restart: unless-stopped
 BIZYAML
-
-if [[ "$NEED_MYSQL" == "true" ]]; then cat >> "$BIZ_COMPOSE" << 'MYSQL'
-
-  mysql:
-    image: mysql:8.0
-    environment:
-      MYSQL_ROOT_PASSWORD: mock123
-    ports: ["3306:3306"]
-    volumes: [mysql-data:/var/lib/mysql]
-    restart: unless-stopped
-MYSQL
-fi
-
-if [[ "$NEED_REDIS" == "true" ]]; then cat >> "$BIZ_COMPOSE" << 'REDIS'
-
-  redis:
-    image: redis:7-alpine
-    ports: ["6379:6379"]
-    restart: unless-stopped
-REDIS
-fi
-
-if [[ "$NEED_ES" == "true" ]]; then cat >> "$BIZ_COMPOSE" << 'ES'
-
-  elasticsearch:
-    image: elasticsearch:8.11.4
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms512m -Xmx512m
-    ports: ["9200:9200"]
-    volumes: [es-data:/usr/share/elasticsearch/data]
-    restart: unless-stopped
-ES
-fi
-
-if [[ "$NEED_MYSQL" == "true" || "$NEED_ES" == "true" ]]; then
-    echo "" >> "$BIZ_COMPOSE"
-    echo "volumes:" >> "$BIZ_COMPOSE"
-    [[ "$NEED_MYSQL" == "true" ]] && echo "  mysql-data:" >> "$BIZ_COMPOSE"
-    [[ "$NEED_ES"    == "true" ]] && echo "  es-data:"    >> "$BIZ_COMPOSE"
-fi
 
 ok "业务服务配置生成完成"
 
