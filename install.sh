@@ -1,0 +1,785 @@
+#!/bin/bash
+# install.sh — mock-mesh 沙箱一键安装
+#
+# 用法：
+#   curl -fsSL https://raw.githubusercontent.com/<org>/mock-mesh/master/install.sh | \
+#       sudo -E bash -s -- --psm <psm> --artifact <prefix> [--version <ver>]
+#
+# 认证方式（优先级从高到低）：
+#   1. 环境变量 SCM_JWT_TOKEN（直接使用）
+#   2. bytedcli auth login → 自动获取 JWT
+#   3. 交互式手动粘贴 JWT token
+#
+# 环境变量（可选）：
+#   SCM_JWT_TOKEN   — 手动指定 JWT token，跳过 bytedcli
+#   SCM_USERNAME    — 下载用户名（默认从 bytedcli/git 自动获取）
+#   SCM_BASE_URL    — SCM 产物仓库地址
+#   GIT_REPO_URL    — mock-mesh Git 仓库 SSH 地址
+#   NPM_REGISTRY    — npm 镜像源（安装 bytedcli 时使用）
+#   MOCK_MESH_DIR   — mock-mesh 安装目录（默认 /opt/mock-mesh）
+#
+# 幂等性：
+#   - 重复执行安全，已安装的依赖跳过
+#   - 版本未变且服务在跑 → 直接退出
+#   - 版本变更 → 重新下载并重启
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ── 颜色 ──────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+info()  { echo -e "${BLUE}[·]${NC} $*"; }
+ok()    { echo -e "${GREEN}[✓]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
+step()  { echo -e "\n${BOLD}${CYAN}━━ $* ━━${NC}"; }
+die()   { echo -e "${RED}[✗]${NC} $*" >&2; exit 1; }
+
+# ── 参数解析 ──────────────────────────────────────────────────────────────────
+PSM=""
+ARTIFACT_PREFIX=""
+VERSION=""
+
+usage() {
+    cat <<'USAGE'
+用法: bash install.sh --psm <psm> --artifact <prefix> [--version <ver>]
+
+参数:
+  --psm        服务 PSM
+  --artifact   Luban 产物前缀（仓库路径 / 换 .）
+  --version    产物版本号（可选，不填自动查询最新）
+
+环境变量:
+  SCM_JWT_TOKEN   JWT token（跳过 bytedcli）
+  SCM_USERNAME    下载用户名
+  SCM_BASE_URL    SCM 产物仓库地址
+  GIT_REPO_URL    mock-mesh Git SSH 地址
+  NPM_REGISTRY    npm 镜像源（安装 bytedcli 用）
+  MOCK_MESH_DIR   安装目录（默认 /opt/mock-mesh）
+
+示例:
+  # bytedcli 自动获取 token
+  bytedcli auth login
+  sudo -E bash install.sh --psm xx.yy.zz --artifact xx.yy.zz
+
+  # 手动传 token
+  SCM_JWT_TOKEN="eyJ..." sudo -E bash install.sh --psm xx.yy.zz --artifact xx.yy.zz --version 1.0.0
+USAGE
+    exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --psm)        PSM="$2";              shift 2 ;;
+        --artifact)   ARTIFACT_PREFIX="$2";  shift 2 ;;
+        --version)    VERSION="$2";          shift 2 ;;
+        --help|-h)    usage ;;
+        *) die "未知参数: $1\n$(usage)" ;;
+    esac
+done
+
+[[ -n "$PSM"             ]] || die "缺少 --psm 参数\n\n$(usage)"
+[[ -n "$ARTIFACT_PREFIX" ]] || die "缺少 --artifact 参数\n\n$(usage)"
+
+ARTIFACT_REPO_PATH=$(echo "$ARTIFACT_PREFIX" | tr '.' '/')
+
+# ── 常量（均可通过环境变量覆盖）──────────────────────────────────────────────────
+MOCK_MESH_DIR="${MOCK_MESH_DIR:-/opt/mock-mesh}"
+GIT_REPO_URL="${GIT_REPO_URL:-}"
+SCM_BASE_URL="${SCM_BASE_URL:-}"
+DOCKER_VER="27.3.1"
+GOPROXY="https://goproxy.cn,direct"
+TOKEN_CACHE="${HOME}/.mock-mesh/scm-token"
+
+PSM_SLUG=$(echo "$PSM" | tr '.' '-')
+SANDBOX_DIR="${MOCK_MESH_DIR}/deploy/ecs/sandbox/${PSM_SLUG}"
+STATE_FILE="${SANDBOX_DIR}/.build-state"
+COMPOSE_FILE="${SANDBOX_DIR}/docker-compose.yaml"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JWT 认证（自包含，无需外部脚本）
+# ══════════════════════════════════════════════════════════════════════════════
+
+# 查找 bytedcli
+_find_cli() {
+    command -v bytedcli &>/dev/null && { command -v bytedcli; return; }
+    local nvm_dir="${NVM_DIR:-$HOME/.nvm}"
+    # 调用者可能是 sudo，检查原始用户的 nvm
+    local sudo_nvm="${SUDO_USER:+/home/${SUDO_USER}/.nvm}"
+    for d in "$nvm_dir" "$sudo_nvm"; do
+        [[ -z "$d" || ! -d "$d" ]] && continue
+        for b in "$d"/versions/node/*/bin/bytedcli; do
+            [[ -x "$b" ]] && { echo "$b"; return; }
+        done
+    done
+    return 1
+}
+
+# 确保 bytedcli 已登录
+_ensure_login() {
+    local cli="$1"
+    if "$cli" auth status --json 2>/dev/null | grep -q '"loggedIn":true'; then
+        return 0
+    fi
+    info "需要 SSO 登录，将打开浏览器..."
+    "$cli" auth login >&2
+    "$cli" auth status --json 2>/dev/null | grep -q '"loggedIn":true' || {
+        die "SSO 登录失败，请先在普通用户下执行: bytedcli auth login"
+    }
+}
+
+# 获取用户名（邮箱前缀）
+_get_username() {
+    [[ -n "${SCM_USERNAME:-}" ]] && { echo "$SCM_USERNAME"; return; }
+
+    if [[ -f "$TOKEN_CACHE" ]]; then
+        local u; u=$(grep "^USERNAME=" "$TOKEN_CACHE" 2>/dev/null | cut -d= -f2-)
+        [[ -n "$u" ]] && { echo "$u"; return; }
+    fi
+
+    local cli; cli=$(_find_cli 2>/dev/null) || true
+    if [[ -n "$cli" ]]; then
+        local email; email=$("$cli" auth userinfo --json 2>/dev/null | grep -o '"email":"[^"]*"' | cut -d'"' -f4 || true)
+        [[ -n "$email" ]] && { echo "${email%%@*}"; return; }
+    fi
+
+    local ge; ge=$(git config user.email 2>/dev/null || true)
+    if [[ -n "$ge" ]]; then
+        local guess="${ge%%@*}"
+        read -rp "  用户名 (邮箱前缀) [${guess}]: " input
+        echo "${input:-$guess}"
+        return
+    fi
+
+    read -rp "  请输入用户名 (邮箱前缀): " input
+    [[ -n "$input" ]] || die "用户名不能为空"
+    echo "$input"
+}
+
+# 获取 JWT token
+_get_token() {
+    # 1. 环境变量
+    [[ -n "${SCM_JWT_TOKEN:-}" ]] && { echo "$SCM_JWT_TOKEN"; return; }
+
+    # 2. 缓存（20h 有效）
+    if [[ -f "$TOKEN_CACHE" ]]; then
+        local ct cs now
+        ct=$(grep "^TOKEN=" "$TOKEN_CACHE" 2>/dev/null | cut -d= -f2-)
+        cs=$(grep "^TIMESTAMP=" "$TOKEN_CACHE" 2>/dev/null | cut -d= -f2-)
+        now=$(date +%s)
+        if [[ -n "$ct" && -n "$cs" && $(( now - cs )) -lt 72000 ]]; then
+            info "使用缓存 token ($(( (now - cs) / 3600 ))h ago)"
+            echo "$ct"
+            return
+        fi
+        [[ -n "$ct" ]] && warn "缓存 token 已过期，重新获取..."
+    fi
+
+    # 3. bytedcli
+    local cli; cli=$(_find_cli 2>/dev/null) || true
+    if [[ -n "$cli" ]]; then
+        _ensure_login "$cli"
+        local t; t=$("$cli" auth get-bytecloud-jwt-token 2>/dev/null || true)
+        if [[ -n "$t" && ${#t} -gt 20 ]]; then
+            ok "JWT token 获取成功 (via bytedcli, ${#t} chars)"
+            echo "$t"
+            return
+        fi
+        warn "bytedcli get-bytecloud-jwt-token 返回为空"
+    fi
+
+    # 4. 手动输入
+    echo "" >&2
+    echo -e "  ${BOLD}需要 JWT Token 认证${NC}" >&2
+    echo -e "  获取: 安装 bytedcli 后执行 ${BOLD}bytedcli auth login${NC}" >&2
+    echo "" >&2
+    read -rsp "  请粘贴 JWT Token (输入不可见): " t; echo "" >&2
+    [[ -n "$t" ]] || die "Token 不能为空"
+    echo "$t"
+}
+
+# 保存认证缓存
+_save_cache() {
+    mkdir -p "$(dirname "$TOKEN_CACHE")"
+    cat > "$TOKEN_CACHE" <<CACHE
+USERNAME=$1
+TOKEN=$2
+TIMESTAMP=$(date +%s)
+CACHE
+    chmod 600 "$TOKEN_CACHE"
+}
+
+# 带认证下载
+_authed_curl() {
+    local url="$1" output="$2" token="$3" username="$4"
+    curl -sL \
+        -H "x-jwt-token: ${token}" \
+        -H "x-platform-proxy-user: ${username}" \
+        -o "$output" -w "%{http_code}" \
+        "$url" 2>/dev/null
+}
+
+# SCM 产物下载（含重试）
+scm_download() {
+    local url="$1" output="$2"
+    local username token http_code
+
+    username=$(_get_username) || return 1
+    token=$(_get_token) || return 1
+
+    info "下载: $(basename "$url")"
+    info "用户: ${username}"
+
+    http_code=$(_authed_curl "$url" "$output" "$token" "$username")
+
+    # 401/403 → 清缓存重试
+    if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
+        warn "Token 无效 (HTTP ${http_code})，重新获取..."
+        rm -f "$TOKEN_CACHE"
+        unset SCM_JWT_TOKEN 2>/dev/null || true
+        token=$(_get_token) || return 1
+        http_code=$(_authed_curl "$url" "$output" "$token" "$username")
+    fi
+
+    if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]] && [[ -f "$output" && -s "$output" ]]; then
+        _save_cache "$username" "$token"
+        ok "下载成功: $(du -sh "$output" | cut -f1)"
+        return 0
+    else
+        rm -f "$output"
+        die "下载失败 (HTTP ${http_code})"
+    fi
+}
+
+compose_cmd() {
+    if docker compose version &>/dev/null 2>&1; then
+        docker compose "$@"
+    else
+        docker-compose "$@"
+    fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 0 — 预检 & 环境变量
+# ══════════════════════════════════════════════════════════════════════════════
+step "预检"
+
+[[ "$(uname -m)" == "x86_64" ]] || die "仅支持 x86_64，当前: $(uname -m)"
+[[ "$(id -u)" == "0" ]] || die "请以 root 运行: sudo -E bash install.sh ..."
+
+# 必须通过环境变量提供的地址（脚本不硬编码内部域名）
+if [[ -z "$SCM_BASE_URL" ]]; then
+    die "请设置 SCM_BASE_URL 环境变量\n  示例: export SCM_BASE_URL=https://your-scm-host/repository/scm"
+fi
+if [[ -z "$GIT_REPO_URL" ]]; then
+    die "请设置 GIT_REPO_URL 环境变量\n  示例: export GIT_REPO_URL=git@your-git-host:org/mock-mesh.git"
+fi
+
+ok "PSM:      ${PSM}"
+ok "产物前缀: ${ARTIFACT_PREFIX}"
+ok "SCM:      ${SCM_BASE_URL}"
+ok "Git:      ${GIT_REPO_URL}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1 — 环境检查与安装
+# ══════════════════════════════════════════════════════════════════════════════
+step "环境检查与安装"
+ok "架构: x86_64，权限: root"
+
+info "安装基础依赖..."
+apt-get update -qq 2>/dev/null
+apt-get install -y --no-install-recommends \
+    git curl ca-certificates iptables ip6tables \
+    iproute2 kmod gosu python3 2>/dev/null | grep -E 'newly installed|already' || true
+ok "基础依赖 OK"
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+install_docker() {
+    info "安装 Docker ${DOCKER_VER}..."
+    if apt-get install -y --no-install-recommends docker.io 2>/dev/null; then
+        ok "docker.io 从 apt 安装"
+        return
+    fi
+    info "apt 无 docker.io，下载静态二进制..."
+    local url="https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VER}.tgz"
+    curl -fsSL "$url" -o /tmp/docker.tgz || die "Docker 下载失败: $url"
+    tar -xzf /tmp/docker.tgz -C /tmp && cp /tmp/docker/* /usr/local/bin/
+    chmod +x /usr/local/bin/docker* && rm -f /tmp/docker.tgz
+    [[ -f /usr/bin/dockerd ]] || ln -sf /usr/local/bin/dockerd /usr/bin/dockerd
+    [[ -f /usr/bin/docker  ]] || ln -sf /usr/local/bin/docker  /usr/bin/docker
+    ok "Docker 静态二进制安装到 /usr/local/bin/"
+}
+
+if docker version &>/dev/null 2>&1; then
+    ok "Docker: $(docker version --format '{{.Server.Version}}' 2>/dev/null)"
+else
+    install_docker
+fi
+
+groupadd docker 2>/dev/null || true
+
+if ! systemctl is-active containerd &>/dev/null; then
+    info "配置 containerd..."
+    if [[ ! -f /etc/systemd/system/containerd.service ]]; then
+        cat > /etc/systemd/system/containerd.service << 'EOF'
+[Unit]
+Description=containerd container runtime
+After=network.target
+[Service]
+ExecStartPre=-/sbin/modprobe overlay
+ExecStart=/usr/local/bin/containerd
+Restart=always
+RestartSec=5
+Delegate=yes
+KillMode=process
+LimitNOFILE=1048576
+LimitNPROC=infinity
+LimitCORE=infinity
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
+    systemctl daemon-reload
+    systemctl enable --now containerd
+fi
+
+if ! docker version &>/dev/null 2>&1; then
+    info "启动 Docker daemon..."
+    systemctl daemon-reload
+    systemctl enable --now docker 2>/dev/null || \
+        nohup dockerd > /var/log/dockerd.log 2>&1 &
+    for i in $(seq 1 20); do docker version &>/dev/null && break; sleep 1; done
+fi
+docker version &>/dev/null || die "Docker daemon 启动失败，查看: journalctl -u docker"
+ok "Docker daemon 运行中"
+
+if ! grep -q "registry-mirrors" /etc/docker/daemon.json 2>/dev/null; then
+    info "配置镜像加速..."
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json << 'EOF'
+{
+  "registry-mirrors": [
+    "https://docker.mirrors.ustc.edu.cn",
+    "https://hub-mirror.c.163.com",
+    "https://mirror.baidubce.com"
+  ],
+  "log-driver": "json-file",
+  "log-opts": {"max-size": "100m", "max-file": "3"}
+}
+EOF
+    systemctl reload docker 2>/dev/null || kill -HUP "$(pgrep dockerd)" 2>/dev/null || true
+    sleep 2
+    ok "镜像加速配置完成"
+fi
+
+if ! (docker compose version &>/dev/null 2>&1 || command -v docker-compose &>/dev/null); then
+    info "安装 Docker Compose..."
+    if ! apt-get install -y --no-install-recommends docker-compose 2>/dev/null; then
+        pip3 install docker-compose \
+            -i https://pypi.tuna.tsinghua.edu.cn/simple \
+            --break-system-packages 2>/dev/null || \
+        pip3 install docker-compose \
+            -i https://mirrors.aliyun.com/pypi/simple/ \
+            --break-system-packages || \
+        die "Docker Compose 安装失败，请手动安装"
+    fi
+fi
+ok "Docker Compose: $(docker compose version --short 2>/dev/null || docker-compose version --short 2>/dev/null)"
+
+# ── xt_owner & 内核参数 ────────────────────────────────────────────────────────
+modprobe xt_owner 2>/dev/null || true
+grep -qx xt_owner /etc/modules 2>/dev/null || echo "xt_owner" >> /etc/modules
+if iptables -t nat -A OUTPUT -m owner --uid-owner 65534 -p tcp -j RETURN 2>/dev/null; then
+    iptables -t nat -D OUTPUT -m owner --uid-owner 65534 -p tcp -j RETURN 2>/dev/null || true
+    ok "xt_owner 可用"
+else
+    warn "xt_owner 不可用，iptables uid 过滤将失效"
+fi
+sysctl -w net.ipv4.ip_forward=1 > /dev/null
+echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-mock-mesh.conf
+ok "内核参数 OK"
+
+# ── bytedcli（前置依赖，必须安装）────────────────────────────────────────────
+NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmjs.org}"
+
+install_bytedcli() {
+    if ! command -v node &>/dev/null; then
+        info "安装 Node.js..."
+        apt-get install -y --no-install-recommends nodejs npm 2>/dev/null || {
+            curl -fsSL https://deb.nodesource.com/setup_20.x | bash - 2>/dev/null
+            apt-get install -y nodejs
+        }
+        command -v node &>/dev/null || die "Node.js 安装失败"
+        ok "Node.js: $(node --version)"
+    fi
+    info "安装 bytedcli..."
+    NPM_CONFIG_REGISTRY="$NPM_REGISTRY" \
+        npm install -g @bytedance-dev/bytedcli@latest 2>/dev/null || \
+        die "bytedcli 安装失败\n  请手动安装: NPM_CONFIG_REGISTRY=<your-npm-registry> npm install -g @bytedance-dev/bytedcli@latest"
+}
+
+if _find_cli &>/dev/null; then
+    ok "bytedcli: $(_find_cli)"
+else
+    install_bytedcli
+    _find_cli &>/dev/null || die "bytedcli 安装后仍无法找到，请检查 PATH"
+    ok "bytedcli: $(_find_cli)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2 — 确定版本 + 下载 SCM 产物
+# ══════════════════════════════════════════════════════════════════════════════
+step "下载 SCM 产物"
+
+mkdir -p "$SANDBOX_DIR"
+
+# 读取上次部署的版本
+LAST_VERSION=""
+if [[ -f "$STATE_FILE" ]]; then
+    LAST_VERSION=$(grep "^VERSION=" "$STATE_FILE" | cut -d= -f2 || true)
+fi
+
+# 自动查询最新成功构建版本
+if [[ -z "$VERSION" ]]; then
+    info "通过 bytedcli 查询最新成功构建版本 (${ARTIFACT_REPO_PATH})..."
+    VERSION=$(bytedcli scm list-repo-version "$ARTIFACT_REPO_PATH" \
+        --status build_ok --page-size 1 --json 2>/dev/null | \
+        python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d['data'][0]['version'])
+except Exception:
+    pass
+" 2>/dev/null || true)
+    [[ -n "$VERSION" ]] || die "未能自动获取版本号，请通过 --version 指定\n示例: --version 1.0.1.852"
+fi
+
+ARTIFACT_FILE="${ARTIFACT_PREFIX}_${VERSION}.tar.gz"
+ARTIFACT_URL="${SCM_BASE_URL}/${ARTIFACT_FILE}"
+ARTIFACT_PATH="${SANDBOX_DIR}/${ARTIFACT_FILE}"
+
+ok "目标版本: ${VERSION}  产物: ${ARTIFACT_FILE}"
+
+# 幂等：版本未变且服务在跑 → 直接退出
+if [[ "$VERSION" == "$LAST_VERSION" ]]; then
+    if compose_cmd -f "$COMPOSE_FILE" ps --services --filter status=running 2>/dev/null | grep -q biz-service; then
+        ok "版本未变 (${VERSION})，服务运行中，无需操作"
+        compose_cmd -f "$COMPOSE_FILE" ps
+        exit 0
+    else
+        info "版本未变 (${VERSION})，但服务未运行，重新启动..."
+        compose_cmd -f "$COMPOSE_FILE" up -d
+        exit 0
+    fi
+fi
+
+# 下载（已存在则跳过）
+if [[ -f "$ARTIFACT_PATH" ]]; then
+    ok "产物已缓存: ${ARTIFACT_FILE}"
+else
+    info "下载 ${ARTIFACT_URL} ..."
+    scm_download "$ARTIFACT_URL" "$ARTIFACT_PATH"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — 解压分析，扫描依赖
+# ══════════════════════════════════════════════════════════════════════════════
+step "分析业务服务"
+
+EXTRACT_DIR="${SANDBOX_DIR}/extracted"
+rm -rf "$EXTRACT_DIR" && mkdir -p "$EXTRACT_DIR"
+tar -xzf "$ARTIFACT_PATH" -C "$EXTRACT_DIR"
+ok "解压完成 → $EXTRACT_DIR"
+
+# 读取二进制名（bin/ 下第一个可执行文件）
+BIN_NAME=$(find "$EXTRACT_DIR/bin" -maxdepth 1 -type f -executable 2>/dev/null | head -1 | xargs -r basename || true)
+[[ -n "$BIN_NAME" ]] || BIN_NAME=$(echo "$PSM" | awk -F. '{print $NF}')
+ok "二进制: $BIN_NAME"
+
+# 确认 bootstrap.sh 存在
+if [[ -f "$EXTRACT_DIR/bootstrap.sh" ]]; then
+    ok "bootstrap.sh 存在"
+else
+    warn "未找到 bootstrap.sh，容器将直接执行 ./bin/${BIN_NAME}"
+fi
+
+# 扫描 conf/ 中的下游 PSM 依赖
+DOWNSTREAM_PSMS=()
+CONFIG_FILE=$(find "$EXTRACT_DIR/conf" -name "*.yaml" 2>/dev/null | head -1 || true)
+if [[ -n "$CONFIG_FILE" ]]; then
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && DOWNSTREAM_PSMS+=("$line")
+    done < <(grep -oE 'psm: ["\x27]?[a-z0-9._*]+' "$CONFIG_FILE" 2>/dev/null | \
+             awk '{print $2}' | tr -d "\"'" | sort -u || true)
+fi
+
+NEED_MYSQL=false; NEED_ES=false; NEED_REDIS=false
+for psm in "${DOWNSTREAM_PSMS[@]:-}"; do
+    [[ "$psm" == toutiao.mysql.* ]] && NEED_MYSQL=true
+    [[ "$psm" == byte.es.*       ]] && NEED_ES=true
+    [[ "$psm" == toutiao.redis.* ]] && NEED_REDIS=true
+done
+ok "依赖: MySQL=${NEED_MYSQL} ES=${NEED_ES} Redis=${NEED_REDIS}，下游PSM: ${#DOWNSTREAM_PSMS[@]} 个"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4 — 拉取 mock-mesh 代码
+# ══════════════════════════════════════════════════════════════════════════════
+step "拉取 mock-mesh"
+
+if [[ -d "${MOCK_MESH_DIR}/.git" ]]; then
+    info "更新 mock-mesh..."
+    git -C "$MOCK_MESH_DIR" pull --quiet
+else
+    info "克隆 mock-mesh..."
+    git clone --depth=50 "$GIT_REPO_URL" "$MOCK_MESH_DIR"
+fi
+CURR_MOCK_HASH=$(git -C "$MOCK_MESH_DIR" rev-parse HEAD)
+ok "mock-mesh: ${CURR_MOCK_HASH:0:8}"
+
+# mock-mesh 是否有变更（决定是否重新 build mock 镜像）
+LAST_MOCK_HASH=$(grep "^MOCK_HASH=" "$STATE_FILE" 2>/dev/null | cut -d= -f2 || true)
+MOCK_CHANGED=false
+[[ "$CURR_MOCK_HASH" != "$LAST_MOCK_HASH" ]] && MOCK_CHANGED=true
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5 — 生成沙箱配置
+# ══════════════════════════════════════════════════════════════════════════════
+step "生成沙箱配置"
+
+# entrypoint-biz.sh
+cat > "${SANDBOX_DIR}/entrypoint-biz.sh" << 'EOF'
+#!/bin/sh
+set -e
+PROXY_PORT="${PROXY_PORT:-19999}"
+BIZ_UID="${BIZ_UID:-1000}"
+iptables  -t nat -A OUTPUT -m owner --uid-owner "$BIZ_UID" -p tcp -j REDIRECT --to-port "$PROXY_PORT" || true
+ip6tables -t nat -A OUTPUT -m owner --uid-owner "$BIZ_UID" -p tcp -j REDIRECT --to-port "$PROXY_PORT" || true
+echo "[entrypoint-biz] iptables: uid=$BIZ_UID → :$PROXY_PORT"
+exec gosu "$BIZ_UID:$BIZ_UID" "$@"
+EOF
+chmod +x "${SANDBOX_DIR}/entrypoint-biz.sh"
+
+# Dockerfile.biz — 单阶段，直接解压 SCM 产物，无需 Go 编译环境
+# 构建上下文为 SANDBOX_DIR，产物 tar.gz 已在其中
+# Docker ADD 对 .tar.gz 自动解压到目标目录
+CMD_LINE="./bootstrap.sh"
+[[ ! -f "$EXTRACT_DIR/bootstrap.sh" ]] && CMD_LINE="./bin/${BIN_NAME}"
+
+cat > "${SANDBOX_DIR}/Dockerfile.biz" << EOF
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+        ca-certificates iptables ip6tables gosu \\
+    && rm -rf /var/lib/apt/lists/*
+RUN groupadd -g 1000 app && useradd -u 1000 -g 1000 -m app
+WORKDIR /app
+ADD ${ARTIFACT_FILE} ./
+RUN find bin -type f -exec chmod +x {} \\; \\
+    && (chmod +x bootstrap.sh 2>/dev/null || true) \\
+    && chown -R app:app /app
+COPY entrypoint-biz.sh /entrypoint-biz.sh
+RUN chmod +x /entrypoint-biz.sh
+EXPOSE 8888 18888
+ENTRYPOINT ["/entrypoint-biz.sh"]
+CMD ["${CMD_LINE}"]
+EOF
+
+# mock-config-extra.yaml（下游 RPC PSM → mock）
+cat > "${SANDBOX_DIR}/mock-config-extra.yaml" << YAML
+# 自动生成 — ${PSM} @ ${VERSION}
+default_action: passthrough
+rules:
+YAML
+for psm in "${DOWNSTREAM_PSMS[@]:-}"; do
+    case "$psm" in
+        toutiao.mysql.*|toutiao.redis.*|byte.es.*) ;;
+        *)
+            cat >> "${SANDBOX_DIR}/mock-config-extra.yaml" << YAML
+  - name: "$(echo "$psm" | tr '.' '-')"
+    psm: "${psm}"
+    action: mock
+    protocol: kitex
+YAML
+            ;;
+    esac
+done
+
+# docker-compose.yaml
+DEPENDS="[mock-proxy, kitex-mock, http-mock"
+[[ "$NEED_MYSQL" == "true" ]] && DEPENDS="${DEPENDS}, mysql"
+[[ "$NEED_ES"    == "true" ]] && DEPENDS="${DEPENDS}, elasticsearch"
+[[ "$NEED_REDIS" == "true" ]] && DEPENDS="${DEPENDS}, redis"
+DEPENDS="${DEPENDS}]"
+
+cat > "$COMPOSE_FILE" << EOF
+version: "3.9"
+# 自动生成 — sandbox for ${PSM} @ ${VERSION}
+
+services:
+  mock-proxy:
+    build:
+      context: ${MOCK_MESH_DIR}
+      dockerfile: deploy/Dockerfile.proxy
+      args:
+        - GOPROXY=${GOPROXY}
+    user: "1337:1337"
+    ports:
+      - "19999:19999"
+      - "8600:8600"
+      - "28080:28080"
+    volumes:
+      - ${MOCK_MESH_DIR}/configs:/etc/mock-mesh/configs:ro
+      - ${MOCK_MESH_DIR}/idl:/etc/mock-mesh/idl:ro
+      - ${SANDBOX_DIR}/mock-config-extra.yaml:/etc/mock-mesh/configs/mock-config-extra.yaml:ro
+    environment:
+      - MOCK_CONFIG=/etc/mock-mesh/configs/mock-config.yaml
+      - MOCK_RULES_DIR=/etc/mock-mesh/configs/mock-rules
+      - MOCK_KITEX_ADDR=127.0.0.1:18001
+      - MOCK_GRPC_ADDR=127.0.0.1:18002
+      - MOCK_HTTP_ADDR=127.0.0.1:18003
+    restart: unless-stopped
+
+  kitex-mock:
+    build:
+      context: ${MOCK_MESH_DIR}
+      dockerfile: deploy/Dockerfile.kitex-mock
+      args:
+        - GOPROXY=${GOPROXY}
+    network_mode: "service:mock-proxy"
+    volumes:
+      - ${MOCK_MESH_DIR}/configs:/etc/mock-mesh/configs:ro
+      - ${MOCK_MESH_DIR}/idl:/etc/mock-mesh/idl:ro
+    depends_on: [mock-proxy]
+    restart: unless-stopped
+
+  http-mock:
+    build:
+      context: ${MOCK_MESH_DIR}
+      dockerfile: deploy/Dockerfile.http-mock
+      args:
+        - GOPROXY=${GOPROXY}
+    network_mode: "service:mock-proxy"
+    volumes:
+      - ${MOCK_MESH_DIR}/configs:/etc/mock-mesh/configs:ro
+    depends_on: [mock-proxy]
+    restart: unless-stopped
+
+  biz-service:
+    build:
+      context: ${SANDBOX_DIR}
+      dockerfile: ${SANDBOX_DIR}/Dockerfile.biz
+    network_mode: "service:mock-proxy"
+    cap_add: [NET_ADMIN]
+    depends_on: ${DEPENDS}
+    environment:
+      - PSM=${PSM}
+      - CONSUL_HTTP_ADDR=127.0.0.1:8600
+      - MESH_NEGOTIATE_ADDR=
+      - SERVICE_MESH_EGRESS_ADDR=
+      - KITEX_LOG_DIR=/tmp/logs
+      - RUNTIME_LOGDIR=/tmp/logs
+      - PROXY_PORT=19999
+    restart: unless-stopped
+EOF
+
+if [[ "$NEED_MYSQL" == "true" ]]; then cat >> "$COMPOSE_FILE" << 'EOF'
+
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: mock123
+    ports: ["3306:3306"]
+    volumes: [mysql-data:/var/lib/mysql]
+    restart: unless-stopped
+EOF
+fi
+
+if [[ "$NEED_REDIS" == "true" ]]; then cat >> "$COMPOSE_FILE" << 'EOF'
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    restart: unless-stopped
+EOF
+fi
+
+if [[ "$NEED_ES" == "true" ]]; then cat >> "$COMPOSE_FILE" << 'EOF'
+
+  elasticsearch:
+    image: elasticsearch:8.11.4
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports: ["9200:9200"]
+    volumes: [es-data:/usr/share/elasticsearch/data]
+    restart: unless-stopped
+EOF
+fi
+
+# volumes 块：只在有 named volume 时生成
+if [[ "$NEED_MYSQL" == "true" || "$NEED_ES" == "true" ]]; then
+    echo "" >> "$COMPOSE_FILE"
+    echo "volumes:" >> "$COMPOSE_FILE"
+    [[ "$NEED_MYSQL" == "true" ]] && echo "  mysql-data:" >> "$COMPOSE_FILE"
+    [[ "$NEED_ES"    == "true" ]] && echo "  es-data:"    >> "$COMPOSE_FILE"
+fi
+
+ok "配置文件生成完成 → $SANDBOX_DIR"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 6 — 编译 mock-mesh + 启动
+# ══════════════════════════════════════════════════════════════════════════════
+step "编译 & 启动"
+
+if [[ "$MOCK_CHANGED" == "true" ]]; then
+    info "mock-mesh 有更新，重新编译 mock 镜像（首次约 5-10 分钟）..."
+    compose_cmd -f "$COMPOSE_FILE" build mock-proxy kitex-mock http-mock
+fi
+
+info "启动所有服务（biz-service 直接解压产物，构建极快）..."
+compose_cmd -f "$COMPOSE_FILE" up -d --build biz-service
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 7 — 验证
+# ══════════════════════════════════════════════════════════════════════════════
+step "验证服务"
+
+info "等待服务就绪..."
+sleep 5
+
+compose_cmd -f "$COMPOSE_FILE" ps
+
+if curl -sf --connect-timeout 3 http://127.0.0.1:8600/v1/agent/self > /dev/null 2>&1; then
+    ok "Consul mock 就绪 (:8600)"
+else
+    warn "Consul mock 可能还在启动，稍后检查: curl http://127.0.0.1:8600/v1/agent/self"
+fi
+
+# ── 保存构建状态 ──────────────────────────────────────────────────────────────
+cat > "$STATE_FILE" << EOF
+VERSION=${VERSION}
+MOCK_HASH=${CURR_MOCK_HASH}
+BUILT_AT=$(date -Iseconds)
+PSM=${PSM}
+ARTIFACT=${ARTIFACT_FILE}
+EOF
+
+# ── 完成 ──────────────────────────────────────────────────────────────────────
+HOST_IP=$(hostname -I | awk '{print $1}')
+COMPOSE_BIN=$(command -v docker-compose 2>/dev/null || echo 'docker compose')
+echo ""
+echo -e "${GREEN}${BOLD}══════════════════════════════════════════════"
+echo " 沙箱就绪！"
+echo " PSM:     ${PSM}"
+echo " Version: ${VERSION}"
+echo -e "══════════════════════════════════════════════${NC}"
+echo ""
+echo -e "  Admin UI   → ${CYAN}http://${HOST_IP}:28080${NC}"
+echo -e "  Consul     → ${CYAN}http://${HOST_IP}:8600/v1/health/service/<psm>${NC}"
+echo ""
+echo "  查看日志:  ${COMPOSE_BIN} -f ${COMPOSE_FILE} logs -f biz-service"
+echo "  停止沙箱:  ${COMPOSE_BIN} -f ${COMPOSE_FILE} down"
+echo "  更新版本:  sudo -E bash install.sh --psm ${PSM} --artifact ${ARTIFACT_PREFIX} --version <new-ver>"
+echo ""
