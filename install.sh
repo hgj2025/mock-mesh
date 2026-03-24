@@ -193,12 +193,11 @@ CACHE
 
 # 带认证下载
 _authed_curl() {
-    local url="$1" output="$2" token="$3" username="$4"
-    curl -sL \
+    local url="$1" output="$2" token="$3"
+    curl -f --location --request GET \
         -H "x-jwt-token: ${token}" \
-        -H "x-platform-proxy-user: ${username}" \
         -o "$output" -w "%{http_code}" \
-        "$url" 2>/dev/null
+        "$url" 2>/dev/null || true
 }
 
 # SCM 产物下载（含重试）
@@ -211,8 +210,11 @@ scm_download() {
 
     info "下载: $(basename "$url")"
     info "用户: ${username}"
+    info "URL:  ${url}"
+    info "Token: ${token:0:20}... (${#token} chars)"
+    info "Header: x-jwt-token / x-platform-proxy-user: ${username}"
 
-    http_code=$(_authed_curl "$url" "$output" "$token" "$username")
+    http_code=$(_authed_curl "$url" "$output" "$token")
 
     # 401/403 → 清缓存重试
     if [[ "$http_code" == "401" || "$http_code" == "403" ]]; then
@@ -220,7 +222,7 @@ scm_download() {
         rm -f "$TOKEN_CACHE"
         unset SCM_JWT_TOKEN 2>/dev/null || true
         token=$(_get_token) || return 1
-        http_code=$(_authed_curl "$url" "$output" "$token" "$username")
+        http_code=$(_authed_curl "$url" "$output" "$token")
     fi
 
     if [[ "$http_code" -ge 200 && "$http_code" -lt 300 ]] && [[ -f "$output" && -s "$output" ]]; then
@@ -228,6 +230,12 @@ scm_download() {
         ok "下载成功: $(du -sh "$output" | cut -f1)"
         return 0
     else
+        # 打印响应体帮助排查
+        if [[ -f "$output" ]]; then
+            warn "响应内容（前 500 字节）:"
+            head -c 500 "$output" >&2
+            echo "" >&2
+        fi
         rm -f "$output"
         die "下载失败 (HTTP ${http_code})"
     fi
@@ -241,7 +249,7 @@ step "预检"
 [[ "$(uname -m)" == "x86_64" ]] || die "仅支持 x86_64，当前: $(uname -m)"
 
 if [[ -z "$SCM_BASE_URL" ]]; then
-    die "请设置 SCM_BASE_URL 环境变量\n  示例: export SCM_BASE_URL=https://your-scm-host/repository/scm"
+    die "请设置 SCM_BASE_URL 环境变量\n  示例: export SCM_BASE_URL=http://your-scm-host/repository/scm"
 fi
 
 ok "产物前缀: ${ARTIFACT_PREFIX}"
